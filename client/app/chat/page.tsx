@@ -2,6 +2,7 @@
 
 import type React from "react"
 import { useState, useEffect } from "react"
+import { useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import Image from "next/image"
@@ -20,7 +21,7 @@ export default function ChatPage() {
   const [currentImage, setCurrentImage] = useState<string | null>(null) // The image that can be edited
   const [originalImage, setOriginalImage] = useState<string | null>(null) // The original unedited image
   const [prompt, setPrompt] = useState("")
-  const [generatedImages, setGeneratedImages] = useState<string[]>([])
+  const [generatedImages, setGeneratedImages] = useState<Array<{ id: number; url: string }>>([])
   const [isGenerating, setIsGenerating] = useState(false)
   const [isFullScreen, setIsFullScreen] = useState(false)
   const [chatMessages, setChatMessages] = useState<Array<{ type: "user" | "ai"; content: string; isImage?: boolean }>>(
@@ -28,21 +29,35 @@ export default function ChatPage() {
   )
   const [savedChats, setSavedChats] = useState<SavedChat[]>([])
   const [currentChatId, setCurrentChatId] = useState<number | null>(null)
+  const searchParams = useSearchParams()
+  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000"
 
   useEffect(() => {
-    const savedImage = localStorage.getItem("uploadedImage")
+    // 1) Read the values we already stored on landing
+    const savedImage = localStorage.getItem("uploadedImage");
+    const qpCid = searchParams.get("cid");
+    const lsCid = typeof window !== "undefined" ? localStorage.getItem("conversationId") : null;
+    const cid = qpCid || lsCid;
+  
+    // Show the image immediately
     if (savedImage) {
-      setCurrentImage(savedImage)
-      setOriginalImage(savedImage)
-      setChatMessages([{ type: "user", content: savedImage, isImage: true }])
-      localStorage.removeItem("uploadedImage")
+      setCurrentImage(savedImage);
+      setOriginalImage(savedImage);
+      setChatMessages([{ type: "user", content: savedImage, isImage: true }]);
+      localStorage.removeItem("uploadedImage");
     }
-
-    const storedChats = localStorage.getItem("evolv-chats")
-    if (storedChats) {
-      setSavedChats(JSON.parse(storedChats))
+  
+    // Set conversation id so Generate can use it
+    if (cid) {
+      setCurrentChatId(Number(cid));
+      localStorage.removeItem("conversationId");
     }
-  }, [])
+  
+    // Load any locally-saved chats
+    const storedChats = localStorage.getItem("evolv-chats");
+    if (storedChats) setSavedChats(JSON.parse(storedChats));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadSavedChat = (chat: SavedChat) => {
     setChatMessages(chat.messages)
@@ -89,66 +104,33 @@ export default function ChatPage() {
     setIsGenerating(true)
 
     try {
-      let imageId: number | null = null
+      const cid = searchParams.get("cid") || localStorage.getItem("conversationId")
+      if (!cid) throw new Error("No conversation id")
+      if (!currentImage || !originalImage) throw new Error("No images to edit")
 
-      if (currentImage && originalImage) {
-        const formData = new FormData()
+      const formData = new FormData()
+      const baseResp = await fetch(originalImage)
+      const baseBlob = await baseResp.blob()
+      formData.append("original", baseBlob, "original.png")
 
-        const originalResponse = await fetch(originalImage)
-        const originalBlob = await originalResponse.blob()
-        formData.append("originalImage", originalBlob, "original-image.png")
+      const boxedResp = await fetch(currentImage)
+      const boxedBlob = await boxedResp.blob()
+      formData.append("modified", boxedBlob, "modified.png")
 
-        const currentResponse = await fetch(currentImage)
-        const currentBlob = await currentResponse.blob()
-        formData.append("editedImage", currentBlob, "edited-image.png")
+      formData.append("prompt", prompt.trim())
 
-        const storeResponse = await fetch("/api/store-image", {
-          method: "PUT",
-          body: formData,
-        })
-
-        if (!storeResponse.ok) {
-          throw new Error(`Store image failed: ${storeResponse.status}`)
-        }
-
-        const storeData = await storeResponse.json()
-        imageId = storeData.imageId
-        console.log("[v0] Stored image with ID:", imageId)
-      }
-
-      const generateResponse = await fetch("/api/generate", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          prompt: prompt.trim(),
-          imageId: imageId,
-        }),
-      })
-
-      if (!generateResponse.ok) {
-        throw new Error(`Generate request failed: ${generateResponse.status}`)
-      }
-
-      const generateData = await generateResponse.json()
-
-      if (generateData.imageIds && Array.isArray(generateData.imageIds)) {
-        const imageUrls = generateData.imageIds.map((id: string) => `/api/images/${id}`)
-        setGeneratedImages(imageUrls)
-        console.log("[v0] Generated image IDs:", generateData.imageIds)
-      } else {
-        throw new Error("Invalid response format from backend")
-      }
+      const resp = await fetch(`${BACKEND_URL}/conversations/${cid}/edits`, { method: "POST", body: formData })
+      if (!resp.ok) throw new Error(`Generate failed: ${resp.status}`)
+      const data = await resp.json()
+      const outs = (data?.outputs || []) as Array<{ image_id: number; url: string }>
+      if (!Array.isArray(outs) || outs.length === 0) throw new Error("No outputs")
+      setGeneratedImages(outs.map((o) => ({ id: o.image_id, url: `${BACKEND_URL}/images/${o.image_id}` })))
     } catch (error) {
       console.error("[v0] Generation error:", error)
 
-      const fallbackImages = [
-        "/evolved-landscape-1.jpg",
-        "/evolved-landscape-2.jpg",
-        "/evolved-landscape-3.jpg",
-        "/evolved-landscape-4.jpg",
-      ]
+      const fallbackImages = ["/evolved-landscape-1.jpg", "/evolved-landscape-2.jpg", "/evolved-landscape-3.jpg", "/evolved-landscape-4.jpg"].map(
+        (u, i) => ({ id: -1 - i, url: u }),
+      )
       setGeneratedImages(fallbackImages)
     } finally {
       setIsGenerating(false)
@@ -156,10 +138,22 @@ export default function ChatPage() {
     }
   }
 
-  const handleImageSelect = (imageUrl: string) => {
-    setChatMessages((prev) => [...prev, { type: "user", content: imageUrl, isImage: true }])
-    setCurrentImage(imageUrl)
-    setOriginalImage(imageUrl)
+  const handleImageSelect = async (sel: { id: number; url: string }) => {
+    try {
+      const cid = searchParams.get("cid") || localStorage.getItem("conversationId")
+      if (cid && sel.id > 0) {
+        await fetch(`${BACKEND_URL}/conversations/${cid}/select`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ selected_image_id: sel.id }),
+        })
+      }
+    } catch (e) {
+      // non-fatal
+    }
+    setChatMessages((prev) => [...prev, { type: "user", content: sel.url, isImage: true }])
+    setCurrentImage(sel.url)
+    setOriginalImage(sel.url)
     setGeneratedImages([])
     setPrompt("")
   }
@@ -304,14 +298,14 @@ export default function ChatPage() {
                       <div className="bg-gray-100 p-4 rounded-2xl rounded-bl-md">
                         <p className="text-sm text-gray-600 mb-3">Pick one to evolve further:</p>
                         <div className="grid grid-cols-2 gap-3">
-                          {generatedImages.map((imageUrl, i) => (
+                          {generatedImages.map((out, i) => (
                             <Card
                               key={i}
                               className="p-2 cursor-pointer hover:shadow-lg transition-shadow"
-                              onClick={() => handleImageSelect(imageUrl)}
+                              onClick={() => handleImageSelect(out)}
                             >
                               <img
-                                src={imageUrl || "/placeholder.svg"}
+                                src={out.url || "/placeholder.svg"}
                                 alt={`Option ${i + 1}`}
                                 className="w-full aspect-square object-cover rounded select-none"
                                 draggable={false}
@@ -352,7 +346,7 @@ export default function ChatPage() {
               {currentImage && (
                 <Button
                   onClick={handleGenerate}
-                  disabled={isGenerating}
+                  disabled={isGenerating || !currentChatId || !currentImage || !originalImage}
                   className="bg-[#a7c19c] hover:bg-[#95b089] text-white px-6 py-2 rounded-full"
                 >
                   {isGenerating ? "Generating..." : "Generate"}

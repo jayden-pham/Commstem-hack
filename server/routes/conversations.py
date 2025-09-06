@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from db import db
-from services.storage import save_bytes_as_id, read_path_by_id
+from services.storage import save_image_for_conversation, read_path_by_id
 from services.model import generate_four_edits_from_two_bytes
 from datetime import datetime
 import json, os
@@ -22,46 +22,20 @@ def create_conversation():
     if not file:
         return jsonify({"error":"image required"}), 400
     img_bytes = file.read()
-    img_id, url = save_bytes_as_id(img_bytes)
+    # Create conversation first to obtain cid
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("INSERT INTO conversations(title, current_image_id) VALUES (?, ?)", (title, img_id))
+        cur.execute("INSERT INTO conversations(title, current_image_id) VALUES (?, 0)", (title,))
         cid = cur.lastrowid
         conn.commit()
-    return jsonify({"id": cid, "title": title, "current_image": {"id": img_id, "url": url}})
-
-@conv_bp.get("/conversations")
-def list_conversations():
-    with db() as conn:
-        rows = conn.execute("SELECT id, title FROM conversations ORDER BY id DESC").fetchall()
-    return jsonify([{"id": r["id"], "title": r["title"]} for r in rows])
-
-@conv_bp.get("/conversations/<int:cid>")
-def get_conversation(cid: int):
-    with db() as conn:
-        conv = conn.execute("SELECT id, title, current_image_id FROM conversations WHERE id=?", (cid,)).fetchone()
-        if not conv:
-            return jsonify({"error":"not found"}), 404
-        msgs = conn.execute("SELECT role, kind, content, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC", (cid,)).fetchall()
-    # build current image url
-    path = read_path_by_id(conv["current_image_id"])
-    current = {"id": conv["current_image_id"], "url": f"/images/{conv['current_image_id']}"} if path else None
-    messages = [{"role": m["role"], "kind": m["kind"], "content": json.loads(m["content"]), "created_at": m["created_at"]} for m in msgs]
-    return jsonify({"id": conv["id"], "title": conv["title"], "current_image": current, "messages": messages})
-
-@conv_bp.put("/conversations/<int:cid>")
-def update_conversation(cid: int):
-    data = request.get_json(force=True) or {}
-    title = data.get("title")
-    if not title:
-        return jsonify({"error":"title required"}), 400
+    # Save the provided base image as originals, edit_index=0
+    img_id, url, _ = save_image_for_conversation(img_bytes, cid, 0, "og")
+    # Update conversation's current image
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE conversations SET title=? WHERE id=?", (title, cid))
-        if cur.rowcount == 0:
-            return jsonify({"error":"not found"}), 404
+        cur.execute("UPDATE conversations SET current_image_id=? WHERE id=?", (img_id, cid))
         conn.commit()
-    return jsonify({"ok": True})
+    return jsonify({"id": cid, "title": title, "current_image": {"id": img_id, "url": url}})
 
 @conv_bp.post("/conversations/<int:cid>/edits")
 def conversation_edits(cid: int):
@@ -82,8 +56,6 @@ def conversation_edits(cid: int):
       - Returns JSON: { outputs: [{image_id,url}*4] }
     """
     prompt = (request.form.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "prompt required"}), 400
 
     orig_fs = request.files.get("original")
     mod_fs  = request.files.get("modified")
@@ -99,9 +71,17 @@ def conversation_edits(cid: int):
         if not conv:
             return jsonify({"error": "conversation not found"}), 404
 
-    # save originals first
-    orig_id, orig_url = save_bytes_as_id(orig_bytes)
-    mod_id,  mod_url  = save_bytes_as_id(mod_bytes)
+    # determine edit index from existing user 'edit' messages for this conversation
+    with db() as conn:
+        row = conn.execute("SELECT COUNT(1) AS n FROM messages WHERE conversation_id=? AND kind='edit'", (cid,)).fetchone()
+        edit_index = int(row["n"]) + 1
+
+    # save originals first with naming convention
+    orig_id, _, _ = save_image_for_conversation(orig_bytes, cid, edit_index, "og")
+    mod_id,  _, _ = save_image_for_conversation(mod_bytes,  cid, edit_index, "mod")
+    # Fetch DB-stored paths for logging/response
+    orig_path = read_path_by_id(orig_id)
+    mod_path  = read_path_by_id(mod_id)
 
     # model returns saved Paths; read bytes and store them
     paths = generate_four_edits_from_two_bytes(mod_bytes, orig_bytes, prompt)
@@ -109,8 +89,14 @@ def conversation_edits(cid: int):
     for p in paths:
         with open(p, "rb") as f:
             vb = f.read()
-        image_id, url = save_bytes_as_id(vb)
-        outputs.append({"image_id": image_id, "url": url})
+        out_id, _, _ = save_image_for_conversation(vb, cid, edit_index, "out")
+        out_path = read_path_by_id(out_id)
+        outputs.append({"image_id": out_id, "url": out_path})
+        # remove intermediate model file to avoid leftover boxed_*_v*.png
+        try:
+            os.remove(p)
+        except Exception:
+            pass
 
     # log messages
     with db() as conn:
@@ -121,9 +107,9 @@ def conversation_edits(cid: int):
             (cid, json.dumps({
                 "prompt": prompt,
                 "original_image_id": orig_id,
-                "original_url": orig_url,
+                "original_url": orig_path,
                 "modified_image_id": mod_id,
-                "modified_url": mod_url,
+                "modified_url": mod_path,
             }), now_iso())
         )
         cur.execute(
@@ -175,3 +161,42 @@ def select_variant(cid: int):
         )
         conn.commit()
     return jsonify({"current_image": {"id": sel_int, "url": f"/images/{sel_int}"}, "selected": sel_int})
+
+
+# -------------------------------------------------------------------------------------------------
+# GET /conversations
+# GET /conversations/<int:cid>
+# PUT /conversations/<int:cid>
+# -------------------------------------------------------------------------------------------------
+@conv_bp.get("/conversations")
+def list_conversations():
+    with db() as conn:
+        rows = conn.execute("SELECT id, title FROM conversations ORDER BY id DESC").fetchall()
+    return jsonify([{"id": r["id"], "title": r["title"]} for r in rows])
+
+@conv_bp.get("/conversations/<int:cid>")
+def get_conversation(cid: int):
+    with db() as conn:
+        conv = conn.execute("SELECT id, title, current_image_id FROM conversations WHERE id=?", (cid,)).fetchone()
+        if not conv:
+            return jsonify({"error":"not found"}), 404
+        msgs = conn.execute("SELECT role, kind, content, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC", (cid,)).fetchall()
+    # build current image url
+    path = read_path_by_id(conv["current_image_id"])
+    current = {"id": conv["current_image_id"], "url": f"/images/{conv['current_image_id']}"} if path else None
+    messages = [{"role": m["role"], "kind": m["kind"], "content": json.loads(m["content"]), "created_at": m["created_at"]} for m in msgs]
+    return jsonify({"id": conv["id"], "title": conv["title"], "current_image": current, "messages": messages})
+
+@conv_bp.put("/conversations/<int:cid>")
+def update_conversation(cid: int):
+    data = request.get_json(force=True) or {}
+    title = data.get("title")
+    if not title:
+        return jsonify({"error":"title required"}), 400
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE conversations SET title=? WHERE id=?", (title, cid))
+        if cur.rowcount == 0:
+            return jsonify({"error":"not found"}), 404
+        conn.commit()
+    return jsonify({"ok": True})

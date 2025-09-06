@@ -9,17 +9,35 @@ import { useRef } from "react"
 export default function LandingPage() {
   const router = useRouter()
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000"
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (file && file.type.startsWith("image/")) {
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        const imageData = e.target?.result as string
-        localStorage.setItem("uploadedImage", imageData)
-        router.push("/chat")
-      }
-      reader.readAsDataURL(file)
+      ;(async () => {
+        try {
+          const form = new FormData()
+          form.append("image", file)
+          const resp = await fetch(`${BACKEND_URL}/conversations`, { method: "POST", body: form })
+          if (!resp.ok) throw new Error(`create conversation failed: ${resp.status}`)
+          const data: { id: number; title: string; current_image?: { id: number; url: string } } = await resp.json()
+          const imgUrl = data.current_image?.url ? `${BACKEND_URL}${data.current_image.url}` : ""
+          if (imgUrl) {
+            localStorage.setItem("uploadedImage", imgUrl)
+          }
+          localStorage.setItem("conversationId", String(data.id))
+          router.push(`/chat?cid=${data.id}`)
+        } catch (err) {
+          // Fallback to local preview-only flow
+          const reader = new FileReader()
+          reader.onload = (e) => {
+            const imageData = e.target?.result as string
+            localStorage.setItem("uploadedImage", imageData)
+            router.push("/chat")
+          }
+          reader.readAsDataURL(file)
+        }
+      })()
     }
   }
 
@@ -76,7 +94,7 @@ export default function LandingPage() {
               alt="Upload New Images"
               width={300}
               height={300}
-              className="w-64 h-64 group-hover:scale-105 transition-transform"
+              className="w-64 h-64 group-hover:scale-105 transiontion-transform"
             />
             <p>Upload Image Here</p>
             <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />

@@ -250,12 +250,12 @@ def generate_four_edits_from_files(
     )
 
 # EXAMPLE USAGE:
-paths = generate_four_edits_from_files(
-    boxed_image_path="server/storage/images/2.png",
-    base_image_path="originals/2.png",
-    global_directive="Change the weather from summer to winter",
-    outputs_dir="outputs",
-)
-print("\nSaved files:")
-for p in paths:
-    print(" -", p)
+# paths = generate_four_edits_from_files(
+#     boxed_image_path="server/storage/images/2.png",
+#     base_image_path="originals/2.png",
+#     global_directive="Change the weather from summer to winter",
+#     outputs_dir="server/storage/outputs",
+# )
+# print("\nSaved files:")
+# for p in paths:
+#     print(" -", p)
