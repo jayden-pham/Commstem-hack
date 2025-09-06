@@ -2,7 +2,7 @@ from pathlib import Path
 from io import BytesIO
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, List, Tuple
+from typing import Optional, Union, List, Tuple
 import mimetypes, os, time, uuid, threading
 
 # pip install google-genai pillow python-dotenv
@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env
+load_dotenv()
 
 # ---------- small thread-safe logger ----------
 _print_lock = threading.Lock()
@@ -18,13 +18,19 @@ def log(msg: str) -> None:
     with _print_lock:
         print(msg, flush=True)
 
+# ---------- prompt ----------
 TEMPLATE = """TASK
-You are an image editor. First, if provided, apply the GLOBAL DIRECTIVE to the whole image. Then read every instruction box, perform those edits, and finally remove all boxes.
+You are an image editor. You will be given TWO images after this text:
+1) BASE image (no instruction boxes) — use only for context and to infer content hidden by boxes.
+2) BOXED image (with black/white instruction boxes) — THIS IS THE EDITING TARGET.
+
+First, if provided, apply the GLOBAL DIRECTIVE to the whole scene (both images’ content should be consistent with the directive).
+Then read every instruction box in the BOXED image, perform those edits on the BOXED image, and finally remove all boxes from the BOXED image.
 
 GLOBAL DIRECTIVE (optional, scene-wide)
 • VALUE: "{GLOBAL_DIRECTIVE}"
 
-WHAT COUNTS AS A BOX
+WHAT COUNTS AS A BOX (in the BOXED image)
 • A dark/black semi-transparent rectangle with white text.
 • Use the box center as the anchor; affect the box area (expand up to ~3× if needed).
 
@@ -32,22 +38,22 @@ ALLOWED ACTIONS (case-insensitive)
 • ADD / REMOVE / REPLACE A WITH B / SWAP TO <style>.
 
 EDITING RULES
-• Preserve composition; only change what is requested.
+• Edit ONLY the BOXED image; use the BASE image to reconstruct anything occluded by boxes or text.
+• Preserve composition; change only what is requested by boxes or the global directive.
 • Match lighting, shadows, reflections, textures, perspective, DOF.
 • Respect occlusions; cast plausible shadows.
-• Local box instructions override the global directive in their region.
-• Apply boxes in order: REMOVE → REPLACE → ADD → SWAP.
-• Remove all boxes at the end (no outlines, no text).
+• If local box instructions conflict with the global directive, local instructions take precedence in their region.
+• Apply multiple boxes in order: REMOVE → REPLACE → ADD → SWAP.
+• After all edits, remove every instruction box completely (no outlines, no text).
 
 VARIATION HINT
-• Produce a distinct but valid variant #{VAR} by varying only non-essential attributes (crop/viewpoint, subtle grade/DOF, micro-lighting), never adding/removing beyond the requested edits.
+• Produce a distinct but valid variant #{VAR} by varying only non-essential attributes (crop/viewpoint, subtle grade/DOF, micro-lighting). Do not add new elements beyond the requested edits.
 
 OUTPUT
-• Return the edited IMAGE only — no overlays, no captions, no borders, no boxes.
+• Return the edited IMAGE only (the edited BOXED image) — no overlays, no captions, no borders, no boxes.
 """
 
-# ------------------------ helpers ------------------------
-
+# ---------- helpers ----------
 _FORMAT_TO_MIME = {
     "PNG":  "image/png",
     "JPEG": "image/jpeg",
@@ -57,7 +63,6 @@ _FORMAT_TO_MIME = {
     "TIFF": "image/tiff",
     "TIF":  "image/tiff",
 }
-
 _FORMAT_TO_SUFFIX = {
     "PNG":  ".png",
     "JPEG": ".jpg",
@@ -73,20 +78,14 @@ def _build_prompt(global_str: str, variant_idx: int) -> str:
     return TEMPLATE.replace("{GLOBAL_DIRECTIVE}", g if g else "NONE").replace("{VAR}", str(variant_idx))
 
 def _infer_mime_and_suffix_from_bytes(photo_bytes: bytes, filename_hint: Optional[str]) -> Tuple[str, str]:
-    """Infer a MIME type and file suffix using filename hint first, then PIL format."""
-    mime_hint = None
-    suffix_hint = None
+    mime_hint = suffix_hint = None
     if filename_hint:
         mime_hint, _ = mimetypes.guess_type(filename_hint)
         suffix_hint = Path(filename_hint).suffix.lower() or None
-
-    # Validate & probe with PIL
     with Image.open(BytesIO(photo_bytes)) as im:
         fmt = (im.format or "").upper()
-
     mime_pil   = _FORMAT_TO_MIME.get(fmt)
     suffix_pil = _FORMAT_TO_SUFFIX.get(fmt)
-
     mime   = mime_hint or mime_pil or "image/png"
     suffix = suffix_hint or suffix_pil or ".png"
     return mime, suffix
@@ -119,76 +118,82 @@ def _extract_image_from_response(resp, client: genai.Client) -> Tuple[Optional[b
                 return data, mt
     return None, None
 
-# --------------------- main function ---------------------
-from typing import Optional, Union, List  # make sure these are imported
-
-def generate_four_edits_from_bytes(
-    photo_bytes: bytes,
+# ---------- main (two-image, bytes API) ----------
+def generate_four_edits_from_two_bytes(
+    boxed_bytes: bytes,            # image WITH instruction boxes (target to edit)
+    base_bytes: bytes,             # original image WITHOUT boxes (for de-occlusion/context)
     global_directive: str,
     *,
-    filename_hint: Optional[str] = None,         # e.g., "2.png"
-    outputs_dir: Union[str, Path] = "outputs",   # ← was str | Path
+    boxed_filename_hint: Optional[str] = None,   # e.g., "scene_with_boxes.png"
+    base_filename_hint: Optional[str] = None,    # e.g., "scene_base.png"
+    outputs_dir: Union[str, Path] = "outputs",
     model_name: str = "gemini-2.5-flash-image-preview",
     temperature: float = 0.4,
     max_workers: int = 4,
     api_key: Optional[str] = None,
     client: Optional[genai.Client] = None,
 ) -> List[Path]:
-    
     """
-    Generate FOUR edited variants for a single image (provided as BYTES) and save them to outputs_dir.
-    Prints: call start, response received, and duration per API call.
+    Generate FOUR edited variants using TWO input images:
+      - BASE (no boxes): context only
+      - BOXED (with boxes): the image to edit
+    Saves outputs to outputs_dir and returns list of Paths.
     """
     total_t0 = time.perf_counter()
     _client: genai.Client = client or genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
 
-    # Validate / infer formats
-    mime, suffix = _infer_mime_and_suffix_from_bytes(photo_bytes, filename_hint)
-    size_kb = len(photo_bytes) / 1024.0
+    # Infer formats; output naming is based on the BOXED image
+    boxed_mime, boxed_suffix = _infer_mime_and_suffix_from_bytes(boxed_bytes, boxed_filename_hint)
+    base_mime,  _            = _infer_mime_and_suffix_from_bytes(base_bytes,  base_filename_hint)
 
-    # Stem for naming
-    base_stem = Path(filename_hint).stem if filename_hint else "upload"
-    stem = f"{base_stem}_{uuid.uuid4().hex[:8]}"
+    boxed_kb = len(boxed_bytes) / 1024.0
+    base_kb  = len(base_bytes)  / 1024.0
+
+    base_stem  = Path(base_filename_hint).stem  if base_filename_hint  else "base"
+    boxed_stem = Path(boxed_filename_hint).stem if boxed_filename_hint else "boxed"
+    run_stem   = f"{boxed_stem}_{uuid.uuid4().hex[:8]}"
 
     outputs_dir = Path(outputs_dir); outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create a reusable inline Part once
-    part = types.Part.from_bytes(data=photo_bytes, mime_type=mime)
+    # Create reusable inline Parts (order matters for our prompt references)
+    part_base  = types.Part.from_bytes(data=base_bytes,  mime_type=base_mime)
+    part_boxed = types.Part.from_bytes(data=boxed_bytes, mime_type=boxed_mime)
 
-    log(f"[{stem}] BYTES INPUT size={size_kb:.1f} KB, mime={mime}")
+    log(f"[{run_stem}] INPUTS: BASE={base_kb:.1f} KB ({base_mime}), BOXED={boxed_kb:.1f} KB ({boxed_mime})")
 
     def _one_variant(i: int) -> Path:
         prompt = _build_prompt(global_directive, i)
-        out_path = outputs_dir / f"{stem}_v{i}{suffix}"
+        out_path = outputs_dir / f"{run_stem}_v{i}{boxed_suffix}"
 
         backoff = 1.0
         last_err: Optional[Exception] = None
         for attempt in range(1, 5):
             try:
                 call_t0 = time.perf_counter()
-                log(f"[{stem} v{i}] CALL attempt {attempt} → model={model_name}, temp={temperature}")
+                log(f"[{run_stem} v{i}] CALL attempt {attempt} → model={model_name}, temp={temperature}")
+                # Order: prompt, BASE (context), BOXED (target)
                 resp = _client.models.generate_content(
                     model=model_name,
-                    contents=[prompt, part],  # prompt first, then inline bytes
+                    contents=[prompt, part_base, part_boxed],
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE"],
                         temperature=temperature,
                     ),
                 )
                 call_dt = time.perf_counter() - call_t0
-                log(f"[{stem} v{i}] RECV ← {call_dt:.2f}s")
+                log(f"[{run_stem} v{i}] RECV ← {call_dt:.2f}s")
 
                 img_bytes, _ = _extract_image_from_response(resp, _client)
                 if not img_bytes:
                     raise RuntimeError("No image bytes returned (safety/decoding).")
 
                 Image.open(BytesIO(img_bytes)).save(out_path)
-                log(f"[{stem} v{i}] SAVED → {out_path}")
+                log(f"[{run_stem} v{i}] SAVED → {out_path}")
                 return out_path
 
             except Exception as e:
                 last_err = e
-                log(f"[{stem} v{i}] RETRY {attempt} error: {e}")
+                log(f"[{run_stem} v{i}] RETRY {attempt} error: {e}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
 
@@ -202,27 +207,55 @@ def generate_four_edits_from_bytes(
             try:
                 saved.append(fut.result())
             except Exception as e:
-                log(f"[{stem}] [WARN] {filename_hint or 'upload'}: {e}")
+                log(f"[{run_stem}] [WARN] {boxed_filename_hint or 'boxed'}: {e}")
 
     total_dt = time.perf_counter() - total_t0
-    log(f"[{stem}] SUMMARY: {len(saved)}/4 variant(s) in {total_dt:.2f}s")
+    log(f"[{run_stem}] SUMMARY: {len(saved)}/4 variant(s) in {total_dt:.2f}s")
 
     if not saved:
         raise RuntimeError("All variants failed.")
     return sorted(saved)
 
+# ---------- convenience wrapper: open two files then call bytes-API ----------
+def generate_four_edits_from_files(
+    boxed_image_path: Union[str, Path],   # path to the BOXED (with boxes) image
+    base_image_path:  Union[str, Path],   # path to the BASE (no boxes) image
+    global_directive: str,
+    **kwargs,
+) -> List[Path]:
+    """
+    Wrapper that reads two image files, then calls generate_four_edits_from_two_bytes().
+    kwargs are forwarded (outputs_dir, model_name, temperature, etc.).
+    """
+    boxed_path = Path(boxed_image_path)
+    base_path  = Path(base_image_path)
+
+    if not boxed_path.exists():
+        raise FileNotFoundError(boxed_path)
+    if not base_path.exists():
+        raise FileNotFoundError(base_path)
+
+    with open(boxed_path, "rb") as fb:
+        boxed_bytes = fb.read()
+    with open(base_path, "rb") as fa:
+        base_bytes = fa.read()
+
+    return generate_four_edits_from_two_bytes(
+        boxed_bytes=boxed_bytes,
+        base_bytes=base_bytes,
+        global_directive=global_directive,
+        boxed_filename_hint=boxed_path.name,
+        base_filename_hint=base_path.name,
+        **kwargs,
+    )
+
 # EXAMPLE USAGE:
-# Read the original image into bytes (e.g., from disk or from an upload)
-# with open("images/2.png", "rb") as f:
-#     photo_bytes = f.read()
-
-# paths = generate_four_edits_from_bytes(
-#     photo_bytes=photo_bytes,
+# paths = generate_four_edits_from_files(
+#     boxed_image_path="images/2.png",
+#     base_image_path="originals/2.png",
 #     global_directive="Change the weather from summer to winter",
-#     filename_hint="2.png",     # helps pick the correct suffix and MIME; optional
-#     outputs_dir="outputs"
+#     outputs_dir="outputs",
 # )
-
-# print("Saved files:")
+# print("\nSaved files:")
 # for p in paths:
 #     print(" -", p)
