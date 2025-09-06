@@ -84,28 +84,55 @@ export default function ChatPage() {
     setIsGenerating(true)
 
     try {
-      // Save the current image state before sending to backend
-      const imageToSend = currentImage
+      let imageId: number | null = null
 
-      const response = await fetch("/api/generate", {
+      if (currentImage) {
+        // Convert image to blob for upload
+        const response = await fetch(currentImage)
+        const blob = await response.blob()
+
+        // Create FormData for PNG file upload
+        const formData = new FormData()
+        formData.append("image", blob, "current-image.png")
+
+      ////api call!!!! 
+        const storeResponse = await fetch("/api/store-image", {
+          method: "PUT",
+          body: formData,
+        })
+
+        if (!storeResponse.ok) {
+          throw new Error(`Store image failed: ${storeResponse.status}`)
+        }
+
+        const storeData = await storeResponse.json()
+        imageId = storeData.imageId
+        console.log("[v0] Stored image with ID:", imageId)
+      }
+
+      ////api call!!!! 
+      const generateResponse = await fetch("/api/generate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          currentImage: imageToSend,
-          prompt: prompt.trim()
+          prompt: prompt.trim(),
+          imageId: imageId,
         }),
       })
 
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status}`)
+      if (!generateResponse.ok) {
+        throw new Error(`Generate request failed: ${generateResponse.status}`)
       }
 
-      const data = await response.json()
+      const generateData = await generateResponse.json()
 
-      if (data.generatedImages && Array.isArray(data.generatedImages)) {
-        setGeneratedImages(data.generatedImages)
+      if (generateData.imageIds && Array.isArray(generateData.imageIds)) {
+        // Convert image IDs to URLs for display
+        const imageUrls = generateData.imageIds.map((id: string) => `/api/images/${id}`)
+        setGeneratedImages(imageUrls)
+        console.log("[v0] Generated image IDs:", generateData.imageIds)
       } else {
         throw new Error("Invalid response format from backend")
       }
