@@ -2,7 +2,7 @@ from pathlib import Path
 from io import BytesIO
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Union, List, Tuple
+from typing import Optional, List, Tuple
 import mimetypes, os, time, uuid, threading
 
 # pip install google-genai pillow python-dotenv
@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env in the cwd or project root
+load_dotenv()  # reads .env
 
 # ---------- small thread-safe logger ----------
 _print_lock = threading.Lock()
@@ -46,16 +46,52 @@ OUTPUT
 • Return the edited IMAGE only — no overlays, no captions, no borders, no boxes.
 """
 
-def _guess_mime(path: Path) -> str:
-    mt, _ = mimetypes.guess_type(path.as_posix())
-    return mt or "image/png"
+# ------------------------ helpers ------------------------
+
+_FORMAT_TO_MIME = {
+    "PNG":  "image/png",
+    "JPEG": "image/jpeg",
+    "JPG":  "image/jpeg",
+    "WEBP": "image/webp",
+    "BMP":  "image/bmp",
+    "TIFF": "image/tiff",
+    "TIF":  "image/tiff",
+}
+
+_FORMAT_TO_SUFFIX = {
+    "PNG":  ".png",
+    "JPEG": ".jpg",
+    "JPG":  ".jpg",
+    "WEBP": ".webp",
+    "BMP":  ".bmp",
+    "TIFF": ".tiff",
+    "TIF":  ".tiff",
+}
 
 def _build_prompt(global_str: str, variant_idx: int) -> str:
     g = (global_str or "").strip()
     return TEMPLATE.replace("{GLOBAL_DIRECTIVE}", g if g else "NONE").replace("{VAR}", str(variant_idx))
 
+def _infer_mime_and_suffix_from_bytes(photo_bytes: bytes, filename_hint: Optional[str]) -> Tuple[str, str]:
+    """Infer a MIME type and file suffix using filename hint first, then PIL format."""
+    mime_hint = None
+    suffix_hint = None
+    if filename_hint:
+        mime_hint, _ = mimetypes.guess_type(filename_hint)
+        suffix_hint = Path(filename_hint).suffix.lower() or None
+
+    # Validate & probe with PIL
+    with Image.open(BytesIO(photo_bytes)) as im:
+        fmt = (im.format or "").upper()
+
+    mime_pil   = _FORMAT_TO_MIME.get(fmt)
+    suffix_pil = _FORMAT_TO_SUFFIX.get(fmt)
+
+    mime   = mime_hint or mime_pil or "image/png"
+    suffix = suffix_hint or suffix_pil or ".png"
+    return mime, suffix
+
 def _download_file_bytes(client: genai.Client, file_uri: str) -> bytes:
-    # Be tolerant to SDK signature differences
     for kw in ("name", "file"):
         try:
             return client.files.download(**{kw: file_uri})
@@ -83,49 +119,43 @@ def _extract_image_from_response(resp, client: genai.Client) -> Tuple[Optional[b
                 return data, mt
     return None, None
 
-def generate_four_edits(
-    photo_path: Union[str, Path],
+# --------------------- main function ---------------------
+from typing import Optional, Union, List  # make sure these are imported
+
+def generate_four_edits_from_bytes(
+    photo_bytes: bytes,
     global_directive: str,
     *,
-    outputs_dir: Union[str, Path] = "outputs",
+    filename_hint: Optional[str] = None,         # e.g., "2.png"
+    outputs_dir: Union[str, Path] = "outputs",   # ← was str | Path
     model_name: str = "gemini-2.5-flash-image-preview",
     temperature: float = 0.4,
     max_workers: int = 4,
     api_key: Optional[str] = None,
     client: Optional[genai.Client] = None,
 ) -> List[Path]:
+    
     """
-    Generate FOUR edited variants for a single image and save them to outputs_dir.
+    Generate FOUR edited variants for a single image (provided as BYTES) and save them to outputs_dir.
     Prints: call start, response received, and duration per API call.
     """
     total_t0 = time.perf_counter()
-
-    # Create/obtain client
     _client: genai.Client = client or genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
 
-    photo_path = Path(photo_path)
-    if not photo_path.exists():
-        raise FileNotFoundError(photo_path)
+    # Validate / infer formats
+    mime, suffix = _infer_mime_and_suffix_from_bytes(photo_bytes, filename_hint)
+    size_kb = len(photo_bytes) / 1024.0
+
+    # Stem for naming
+    base_stem = Path(filename_hint).stem if filename_hint else "upload"
+    stem = f"{base_stem}_{uuid.uuid4().hex[:8]}"
 
     outputs_dir = Path(outputs_dir); outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    mime = _guess_mime(photo_path)
-    suffix = photo_path.suffix or ".png"
+    # Create a reusable inline Part once
+    part = types.Part.from_bytes(data=photo_bytes, mime_type=mime)
 
-    # Unique stem per run to avoid collisions
-    stem = f"{photo_path.stem}_{uuid.uuid4().hex[:8]}"
-
-    # Upload once and reuse for all variants
-    up_t0 = time.perf_counter()
-    log(f"[{stem}] UPLOAD → {photo_path.name} (mime={mime})")
-    try:
-        try:
-            file_handle = _client.files.upload(file=str(photo_path), mime_type=mime)
-        except TypeError:
-            file_handle = _client.files.upload(file=str(photo_path))
-    finally:
-        up_dt = time.perf_counter() - up_t0
-        log(f"[{stem}] UPLOAD DONE ← {up_dt:.2f}s")
+    log(f"[{stem}] BYTES INPUT size={size_kb:.1f} KB, mime={mime}")
 
     def _one_variant(i: int) -> Path:
         prompt = _build_prompt(global_directive, i)
@@ -139,7 +169,7 @@ def generate_four_edits(
                 log(f"[{stem} v{i}] CALL attempt {attempt} → model={model_name}, temp={temperature}")
                 resp = _client.models.generate_content(
                     model=model_name,
-                    contents=[prompt, file_handle],  # prompt first, then file
+                    contents=[prompt, part],  # prompt first, then inline bytes
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE"],
                         temperature=temperature,
@@ -162,7 +192,7 @@ def generate_four_edits(
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
 
-        raise RuntimeError("Variant {} failed after retries: {}".format(i, last_err))
+        raise RuntimeError(f"Variant {i} failed after retries: {last_err}")
 
     # Run 4 variants in parallel
     saved: List[Path] = []
@@ -172,7 +202,7 @@ def generate_four_edits(
             try:
                 saved.append(fut.result())
             except Exception as e:
-                log(f"[{stem}] [WARN] {photo_path.name}: {e}")
+                log(f"[{stem}] [WARN] {filename_hint or 'upload'}: {e}")
 
     total_dt = time.perf_counter() - total_t0
     log(f"[{stem}] SUMMARY: {len(saved)}/4 variant(s) in {total_dt:.2f}s")
@@ -181,7 +211,18 @@ def generate_four_edits(
         raise RuntimeError("All variants failed.")
     return sorted(saved)
 
-paths = generate_four_edits(
-    photo_path="images/2.png",
-    global_directive="Change the weather from summer to winter",
-)
+# EXAMPLE USAGE:
+# Read the original image into bytes (e.g., from disk or from an upload)
+# with open("images/2.png", "rb") as f:
+#     photo_bytes = f.read()
+
+# paths = generate_four_edits_from_bytes(
+#     photo_bytes=photo_bytes,
+#     global_directive="Change the weather from summer to winter",
+#     filename_hint="2.png",     # helps pick the correct suffix and MIME; optional
+#     outputs_dir="outputs"
+# )
+
+# print("Saved files:")
+# for p in paths:
+#     print(" -", p)
