@@ -18,6 +18,7 @@ interface SavedChat {
 export default function ChatPage() {
   const [isNavOpen, setIsNavOpen] = useState(true)
   const [currentImage, setCurrentImage] = useState<string | null>(null) // The image that can be edited
+  const [originalImage, setOriginalImage] = useState<string | null>(null) // The original unedited image
   const [prompt, setPrompt] = useState("")
   const [generatedImages, setGeneratedImages] = useState<string[]>([])
   const [isGenerating, setIsGenerating] = useState(false)
@@ -32,6 +33,7 @@ export default function ChatPage() {
     const savedImage = localStorage.getItem("uploadedImage")
     if (savedImage) {
       setCurrentImage(savedImage)
+      setOriginalImage(savedImage)
       setChatMessages([{ type: "user", content: savedImage, isImage: true }])
       localStorage.removeItem("uploadedImage")
     }
@@ -45,6 +47,7 @@ export default function ChatPage() {
   const loadSavedChat = (chat: SavedChat) => {
     setChatMessages(chat.messages)
     setCurrentImage(chat.finalImage)
+    setOriginalImage(chat.finalImage)
     setCurrentChatId(chat.id)
     setGeneratedImages([])
     setPrompt("")
@@ -53,6 +56,7 @@ export default function ChatPage() {
   const startNewChat = () => {
     setChatMessages([])
     setCurrentImage(null)
+    setOriginalImage(null)
     setGeneratedImages([])
     setPrompt("")
     setCurrentChatId(null)
@@ -71,6 +75,7 @@ export default function ChatPage() {
     reader.onload = (e) => {
       const imageUrl = e.target?.result as string
       setCurrentImage(imageUrl)
+      setOriginalImage(imageUrl)
       setChatMessages([{ type: "user", content: imageUrl, isImage: true }])
     }
     reader.readAsDataURL(file)
@@ -86,16 +91,17 @@ export default function ChatPage() {
     try {
       let imageId: number | null = null
 
-      if (currentImage) {
-        // Convert image to blob for upload
-        const response = await fetch(currentImage)
-        const blob = await response.blob()
-
-        // Create FormData for PNG file upload
+      if (currentImage && originalImage) {
         const formData = new FormData()
-        formData.append("image", blob, "current-image.png")
 
-      ////api call!!!! 
+        const originalResponse = await fetch(originalImage)
+        const originalBlob = await originalResponse.blob()
+        formData.append("originalImage", originalBlob, "original-image.png")
+
+        const currentResponse = await fetch(currentImage)
+        const currentBlob = await currentResponse.blob()
+        formData.append("editedImage", currentBlob, "edited-image.png")
+
         const storeResponse = await fetch("/api/store-image", {
           method: "PUT",
           body: formData,
@@ -110,7 +116,6 @@ export default function ChatPage() {
         console.log("[v0] Stored image with ID:", imageId)
       }
 
-      ////api call!!!! 
       const generateResponse = await fetch("/api/generate", {
         method: "POST",
         headers: {
@@ -129,7 +134,6 @@ export default function ChatPage() {
       const generateData = await generateResponse.json()
 
       if (generateData.imageIds && Array.isArray(generateData.imageIds)) {
-        // Convert image IDs to URLs for display
         const imageUrls = generateData.imageIds.map((id: string) => `/api/images/${id}`)
         setGeneratedImages(imageUrls)
         console.log("[v0] Generated image IDs:", generateData.imageIds)
@@ -148,13 +152,14 @@ export default function ChatPage() {
       setGeneratedImages(fallbackImages)
     } finally {
       setIsGenerating(false)
-      setPrompt("") // Clear prompt after generation
+      setPrompt("")
     }
   }
 
   const handleImageSelect = (imageUrl: string) => {
     setChatMessages((prev) => [...prev, { type: "user", content: imageUrl, isImage: true }])
     setCurrentImage(imageUrl)
+    setOriginalImage(imageUrl)
     setGeneratedImages([])
     setPrompt("")
   }
@@ -174,7 +179,6 @@ export default function ChatPage() {
     setSavedChats(updatedChats)
     localStorage.setItem("evolv-chats", JSON.stringify(updatedChats))
 
-    // Download the final image
     const link = document.createElement("a")
     link.href = currentImage
     link.download = `evolv-chat-${nextChatNumber}-${Date.now()}.png`
@@ -182,7 +186,6 @@ export default function ChatPage() {
     link.click()
     document.body.removeChild(link)
 
-    // Reset for new chat
     startNewChat()
   }
 
