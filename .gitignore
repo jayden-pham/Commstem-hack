@@ -220,4 +220,7 @@ __marimo__/
 .streamlit/secrets.tomlgeminicalls.ipynb
 
 outputs/
-client/
+client/node_modules/
+.pnpm-store/
+.pnpm-debug.log
+.pnp.*
