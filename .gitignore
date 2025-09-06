@@ -220,4 +220,4 @@ __marimo__/
 .streamlit/secrets.tomlgeminicalls.ipynb
 
 outputs/
-images/client/node_modules/
+client/
