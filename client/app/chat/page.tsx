@@ -116,16 +116,16 @@ export default function ChatPage() {
       if (!outs.length) throw new Error("No outputs in response")
   
       // helper: resolve relative like "images/123" against *current directory*
-      const toAbsFromCurrentDir = (u: string) => {
+      const toAbsFromBackend = (u: string) => {
         if (!u) return u
         if (/^https?:\/\//i.test(u)) return u
-        // remove any hash/query so resolution is from the page's directory
-        const base = window.location.href.replace(/[#?].*$/, "")
-        return new URL(u, base).toString()
+        // works for "/server/storage/..." and "server/storage/..."
+        return new URL(u, BACKEND_URL).toString()
       }
-
-      // inside handleGenerate, after receiving `outs`
-      const imageUrls: string[] = outs.map(o => toAbsFromCurrentDir(o.url))
+      
+      // after you have `outs`
+      const rawUrls = outs.map(o => o.url)
+      const imageUrls: string[] = outs.map(o => toAbsFromBackend(o.url))
       console.log("[edits] imageUrls (absolute):", imageUrls)
   
       setGeneratedImages(imageUrls)
