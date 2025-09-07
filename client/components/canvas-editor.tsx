@@ -75,6 +75,19 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
   const [draftStroke, setDraftStroke] = useState<Stroke | null>(null)
   const [shapeFill, setShapeFill] = useState<boolean>(true)
 
+  // Extended canvas view metrics (in CSS pixels)
+  type ViewMetrics = {
+    scale: number
+    cssPad: number
+    imgCssW: number
+    imgCssH: number
+    extCssW: number
+    extCssH: number
+  }
+  const [view, setView] = useState<ViewMetrics>({ scale: 1, cssPad: 0, imgCssW: 0, imgCssH: 0, extCssW: 0, extCssH: 0 })
+  // Padding in natural/image pixel space to allow drawing out of bounds
+  const EXT_PADDING_NAT = useRef<number>(1024)
+
   const [textOverlay, setTextOverlay] = useState<{
     active: boolean
     value: string
@@ -104,13 +117,34 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
     const dpr = getDPR()
     const natW = img.naturalWidth || img.width
     const natH = img.naturalHeight || img.height
-    canvas.width = Math.max(1, Math.floor(natW * dpr))
-    canvas.height = Math.max(1, Math.floor(natH * dpr))
+    // Compute fit scale from available viewport (container's parent)
+    // Prefer viewport size and subtract sidebar width (w-16 ~ 64px) to ensure visible fit
+    const hostEl = containerRef.current?.parentElement || document.body
+    const hostRect = hostEl.getBoundingClientRect()
+    const vw = Math.max(1, (window.innerWidth || hostRect.width || 1) - 64 - 24)
+    const vh = Math.max(1, (window.innerHeight || hostRect.height || 1) - 24)
+    const fitScale = Math.min(vw / natW, vh / natH) * 0.98
+    const scale = Number.isFinite(fitScale) && fitScale > 0 ? fitScale : 1
+    const cssPad = (EXT_PADDING_NAT.current || 0) * scale
+    const imgCssW = Math.max(1, natW * scale)
+    const imgCssH = Math.max(1, natH * scale)
+    const extCssW = imgCssW + 2 * cssPad
+    const extCssH = imgCssH + 2 * cssPad
+
+    canvas.width = Math.max(1, Math.floor(extCssW * dpr))
+    canvas.height = Math.max(1, Math.floor(extCssH * dpr))
     ctx.setTransform(1, 0, 0, 1, 0, 0)
     ctx.scale(dpr, dpr)
-    const rect = img.getBoundingClientRect()
-    canvas.style.width = `${rect.width}px`
-    canvas.style.height = `${rect.height}px`
+    canvas.style.width = `${extCssW}px`
+    canvas.style.height = `${extCssH}px`
+    if (containerRef.current) {
+      containerRef.current.style.width = `${extCssW}px`
+      containerRef.current.style.height = `${extCssH}px`
+      containerRef.current.style.margin = "auto"
+      containerRef.current.style.display = "block"
+    }
+    setView({ scale, cssPad, imgCssW, imgCssH, extCssW, extCssH })
+    // No camera/panning
     ctx.lineCap = "round"
     ctx.lineJoin = "round"
     redraw()
@@ -121,31 +155,49 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
     if (!img) return
     const obs = new ResizeObserver(() => setupCanvas())
     obs.observe(img)
-    return () => obs.disconnect()
+    // Also listen to window resize to re-fit canvas to viewport
+    const onResize = () => setupCanvas()
+    window.addEventListener("resize", onResize)
+    return () => {
+      obs.disconnect()
+      window.removeEventListener("resize", onResize)
+    }
   }, [setupCanvas])
+
+  // Ensure setup runs even if image is instantly cached/complete
+  useEffect(() => {
+    const img = imageRef.current
+    if (!img) return
+    if (img.complete) {
+      setupCanvas()
+      return
+    }
+    const handler = () => setupCanvas()
+    img.addEventListener("load", handler, { once: true })
+    return () => img.removeEventListener("load", handler)
+  }, [image, setupCanvas])
+
+  // No panning/space interactions
 
   const clientToNatural = (e: { clientX: number; clientY: number }) => {
     const canvas = canvasRef.current
     const img = imageRef.current
     if (!canvas || !img) return { x: 0, y: 0 }
     const rect = canvas.getBoundingClientRect()
-    const natW = img.naturalWidth || img.width
-    const natH = img.naturalHeight || img.height
     const relX = e.clientX - rect.left
     const relY = e.clientY - rect.top
-    const x = (relX / rect.width) * natW
-    const y = (relY / rect.height) * natH
+    const scale = view.scale || 1
+    const cssPad = view.cssPad || 0
+    const x = (relX - cssPad) / scale
+    const y = (relY - cssPad) / scale
     return { x, y }
   }
 
   const naturalToCss = (nat: { x: number; y: number }) => {
-    const img = imageRef.current
-    if (!img) return { x: 0, y: 0 }
-    const rect = img.getBoundingClientRect()
-    const natW = img.naturalWidth || img.width
-    const natH = img.naturalHeight || img.height
-    const x = (nat.x / natW) * rect.width
-    const y = (nat.y / natH) * rect.height
+    const scale = view.scale || 1
+    const cssPad = view.cssPad || 0
+    const x = nat.x * scale + cssPad
+    const y = nat.y * scale + cssPad
     return { x, y }
   }
 
@@ -250,10 +302,11 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
     const dpr = getDPR()
     ctx.setTransform(1, 0, 0, 1, 0, 0)
     ctx.scale(dpr, dpr)
+    // Base image is rendered via <img> below for reliability; canvas draws only overlays
     for (const s of strokes) drawStrokeOnCtx(ctx, s, "css")
     if (draftStroke) drawStrokeOnCtx(ctx, draftStroke, "css")
     ctx.restore()
-  }, [strokes, draftStroke])
+  }, [strokes, draftStroke, view])
 
   useEffect(() => {
     redraw()
@@ -475,25 +528,123 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
     [strokes]
   )
 
-  const handleSave = () => {
-    try {
-      const img = imageRef.current
-      if (!img) {
-        onSave(image)
-        return
+  // Compute union bounding box of all drawn strokes (in natural/ext coordinates)
+  const getDrawnBounds = (padding = 32) => {
+    if (strokes.length === 0 && !draftStroke) return null
+    let minX = Number.POSITIVE_INFINITY
+    let minY = Number.POSITIVE_INFINITY
+    let maxX = Number.NEGATIVE_INFINITY
+    let maxY = Number.NEGATIVE_INFINITY
+
+    const considerPoint = (p: Point) => {
+      if (p.x < minX) minX = p.x
+      if (p.y < minY) minY = p.y
+      if (p.x > maxX) maxX = p.x
+      if (p.y > maxY) maxY = p.y
+    }
+
+    const considerRect = (x0: number, y0: number, x1: number, y1: number) => {
+      considerPoint({ x: Math.min(x0, x1), y: Math.min(y0, y1) })
+      considerPoint({ x: Math.max(x0, x1), y: Math.max(y0, y1) })
+    }
+
+    const visit = (s: AnyStroke | Stroke) => {
+      if (s.tool === "pen" || s.tool === "eraser") {
+        s.points.forEach(considerPoint)
+      } else if (s.tool === "rectangle") {
+        considerRect(s.start.x, s.start.y, s.end.x, s.end.y)
+      } else if (s.tool === "ellipse") {
+        const cx = (s.start.x + s.end.x) / 2
+        const cy = (s.start.y + s.end.y) / 2
+        const rx = Math.abs(s.end.x - s.start.x) / 2
+        const ry = Math.abs(s.end.y - s.start.y) / 2
+        considerRect(cx - rx, cy - ry, cx + rx, cy + ry)
+      } else if ((s as TextStroke).tool === "text") {
+        const ts = s as TextStroke
+        const width = (ts.fontSize || 24) * 0.6 * (ts.text?.length || 1)
+        considerRect(ts.position.x, ts.position.y, ts.position.x + width, ts.position.y + (ts.fontSize || 24))
       }
+    }
+
+    strokes.forEach(visit)
+    if (draftStroke) visit(draftStroke)
+
+    // Always include original image rect so export contains image + annotations
+    const img = imageRef.current
+    if (img) {
       const natW = img.naturalWidth || img.width
       const natH = img.naturalHeight || img.height
-      const composite = document.createElement("canvas")
-      composite.width = natW
-      composite.height = natH
-      const cctx = composite.getContext("2d")
-      if (!cctx) return
-      // draw base image, then colored strokes for visual composite
-      cctx.drawImage(img, 0, 0, natW, natH)
-      for (const s of strokes) drawStrokeOnCtx(cctx, s, "natural")
-      if (draftStroke) drawStrokeOnCtx(cctx, draftStroke, "natural")
-      const url = composite.toDataURL("image/png")
+      if (isFinite(natW) && isFinite(natH)) {
+        if (0 < minX) minX = 0
+        if (0 < minY) minY = 0
+        if (natW > maxX) maxX = natW
+        if (natH > maxY) maxY = natH
+      }
+    }
+
+    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) return null
+
+    const left = Math.floor(minX - padding)
+    const top = Math.floor(minY - padding)
+    const right = Math.ceil(maxX + padding)
+    const bottom = Math.ceil(maxY + padding)
+    return { left, top, right, bottom, width: Math.max(1, right - left), height: Math.max(1, bottom - top) }
+  }
+
+  const getCroppedImageBlob = async (options?: { padding?: number; type?: string; quality?: number; background?: string }) => {
+    const img = imageRef.current
+    if (!img) throw new Error("Image not loaded")
+    const natW = img.naturalWidth || img.width
+    const natH = img.naturalHeight || img.height
+    const padding = options?.padding ?? 32
+    const bg = options?.background ?? "#ffffff"
+    const bounds = getDrawnBounds(padding)
+
+    if (!bounds) {
+      // No strokes: return full image composite for safety
+      const out = document.createElement("canvas")
+      out.width = natW
+      out.height = natH
+      const octx = out.getContext("2d")
+      if (!octx) throw new Error("2d context unavailable")
+      octx.fillStyle = bg
+      octx.fillRect(0, 0, out.width, out.height)
+      octx.drawImage(img, 0, 0, natW, natH)
+      for (const s of strokes) drawStrokeOnCtx(octx, s as AnyStroke, "natural")
+      if (draftStroke) drawStrokeOnCtx(octx, draftStroke, "natural")
+      return canvasToBlob(out, { type: options?.type, quality: options?.quality })
+    }
+
+    const out = document.createElement("canvas")
+    out.width = bounds.width
+    out.height = bounds.height
+    const octx = out.getContext("2d")
+    if (!octx) throw new Error("2d context unavailable")
+
+    // white background
+    octx.save()
+    octx.setTransform(1, 0, 0, 1, 0, 0)
+    octx.fillStyle = bg
+    octx.fillRect(0, 0, out.width, out.height)
+    octx.restore()
+
+    // draw base image at offset (-left, -top)
+    octx.drawImage(img, -bounds.left, -bounds.top, natW, natH)
+
+    // translate so we can reuse natural coordinates for strokes
+    octx.save()
+    octx.translate(-bounds.left, -bounds.top)
+    for (const s of strokes) drawStrokeOnCtx(octx as unknown as CanvasRenderingContext2D, s as AnyStroke, "natural")
+    if (draftStroke) drawStrokeOnCtx(octx as unknown as CanvasRenderingContext2D, draftStroke, "natural")
+    octx.restore()
+
+    return canvasToBlob(out, { type: options?.type, quality: options?.quality })
+  }
+
+  const handleSave = async () => {
+    try {
+      const blob = await getCroppedImageBlob({ padding: 32, type: "image/png" })
+      const url = URL.createObjectURL(blob)
       onSave(url)
     } catch (err) {
       console.error("Save error:", err)
@@ -503,100 +654,104 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
 
   const canUndo = strokes.length > 0
   const canRedo = redoStack.length > 0
+  const initialized = (view.imgCssW || 0) > 0 && (view.imgCssH || 0) > 0
 
   return (
     <div className="fixed inset-0 bg-white z-50 flex">
-      <div className="w-16 bg-[#a7c19c] flex flex-col items-center py-4 space-y-4">
-        <Button
-          variant={tool === "pen" ? "default" : "ghost"}
-          size="sm"
-          onClick={() => setTool("pen")}
-          className="w-10 h-10 p-0"
-        >
-          <Paintbrush className="w-5 h-5" />
-        </Button>
-        <Button
-          variant={tool === "eraser" ? "default" : "ghost"}
-          size="sm"
-          onClick={() => setTool("eraser")}
-          className="w-10 h-10 p-0"
-        >
-          <Eraser className="w-5 h-5" />
-        </Button>
-        <Button
-          variant={tool === "text" ? "default" : "ghost"}
-          size="sm"
-          onClick={() => setTool("text")}
-          className="w-10 h-10 p-0"
-        >
-          <Type className="w-5 h-5" />
-        </Button>
-        <Button
-          variant={tool === "rectangle" ? "default" : "ghost"}
-          size="sm"
-          onClick={() => setTool("rectangle")}
-          className="w-10 h-10 p-0"
-        >
-          <Square className="w-5 h-5" />
-        </Button>
-        <Button
-          variant={tool === "ellipse" ? "default" : "ghost"}
-          size="sm"
-          onClick={() => setTool("ellipse")}
-          className="w-10 h-10 p-0"
-        >
-          <Circle className="w-5 h-5" />
-        </Button>
+      <div className="w-16 bg-gradient-to-b from-[#b9d2ae] to-[#8fb089] border-r border-black/10 flex flex-col">
+        <div className="flex-1 overflow-y-auto flex flex-col items-center py-4 space-y-4">
+          <Button
+            variant={tool === "pen" ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setTool("pen")}
+            className="w-10 h-10 p-0"
+          >
+            <Paintbrush className="w-5 h-5" />
+          </Button>
+          <Button
+            variant={tool === "eraser" ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setTool("eraser")}
+            className="w-10 h-10 p-0"
+          >
+            <Eraser className="w-5 h-5" />
+          </Button>
+          <Button
+            variant={tool === "text" ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setTool("text")}
+            className="w-10 h-10 p-0"
+          >
+            <Type className="w-5 h-5" />
+          </Button>
+          <Button
+            variant={tool === "rectangle" ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setTool("rectangle")}
+            className="w-10 h-10 p-0"
+          >
+            <Square className="w-5 h-5" />
+          </Button>
+          <Button
+            variant={tool === "ellipse" ? "default" : "ghost"}
+            size="sm"
+            onClick={() => setTool("ellipse")}
+            className="w-10 h-10 p-0"
+          >
+            <Circle className="w-5 h-5" />
+          </Button>
 
-        <div className="w-10 h-px bg-black/20 my-1" />
+          <div className="w-10 h-px bg-black/10 my-1" />
 
-        <div className="px-2 w-full">
-          <Slider
-            min={1}
-            max={40}
-            value={[lineWidth]}
-            onValueChange={(v) => setLineWidth(Array.isArray(v) ? v[0] : lineWidth)}
-            className="h-24 data-[orientation=vertical]:h-24"
-            orientation="vertical"
-          />
-        </div>
-
-        <div className="w-12 grid grid-cols-2 gap-1 px-1">
-          {DEFAULT_COLORS.map((c) => (
-            <button
-              key={c}
-              onClick={() => setColor(c)}
-              className={`w-5 h-5 rounded-full border ${color === c ? "ring-2 ring-black" : ""}`}
-              style={{ backgroundColor: c }}
-              aria-label={`color-${c}`}
+          <div className="px-2 w-full">
+            <Slider
+              min={1}
+              max={40}
+              value={[lineWidth]}
+              onValueChange={(v) => setLineWidth(Array.isArray(v) ? v[0] : lineWidth)}
+              className="h-24 data-[orientation=vertical]:h-24"
+              orientation="vertical"
             />
-          ))}
+          </div>
+
+          <div className="w-12 grid grid-cols-2 gap-1 px-1">
+            {DEFAULT_COLORS.map((c) => (
+              <button
+                key={c}
+                onClick={() => setColor(c)}
+                className={`w-5 h-5 rounded-full border ${color === c ? "ring-2 ring-black" : ""}`}
+                style={{ backgroundColor: c }}
+                aria-label={`color-${c}`}
+              />
+            ))}
+          </div>
+
+          <div className="relative w-10 h-10 rounded-full overflow-hidden border">
+            <div className="absolute inset-0" style={{ backgroundColor: color }} />
+            <input
+              type="color"
+              value={color}
+              onChange={(e) => setColor(e.target.value)}
+              className="absolute inset-0 opacity-0 cursor-pointer"
+              aria-label="custom-color"
+            />
+          </div>
+
+          <div className="w-10 h-px bg-black/10 my-1" />
+
+          <div className="flex flex-col items-center gap-1 px-1 text-[10px] text-gray-700">
+            <span>Fill</span>
+            <Switch checked={shapeFill} onCheckedChange={setShapeFill} />
+          </div>
         </div>
-
-        <div className="relative w-10 h-10 rounded-full overflow-hidden border">
-          <div className="absolute inset-0" style={{ backgroundColor: color }} />
-          <input
-            type="color"
-            value={color}
-            onChange={(e) => setColor(e.target.value)}
-            className="absolute inset-0 opacity-0 cursor-pointer"
-            aria-label="custom-color"
-          />
+        <div className="border-t border-black/10 p-2 flex items-center justify-center gap-2">
+          <Button variant="ghost" size="sm" onClick={undo} disabled={!canUndo} className="w-10 h-10 p-0">
+            <Undo className="w-5 h-5" />
+          </Button>
+          <Button variant="ghost" size="sm" onClick={redo} disabled={!canRedo} className="w-10 h-10 p-0">
+            <Redo className="w-5 h-5" />
+          </Button>
         </div>
-
-        <div className="w-10 h-px bg-black/20 my-1" />
-
-        <div className="flex flex-col items-center gap-1 px-1 text-[10px] text-gray-700">
-          <span>Fill</span>
-          <Switch checked={shapeFill} onCheckedChange={setShapeFill} />
-        </div>
-
-        <Button variant="ghost" size="sm" onClick={undo} disabled={!canUndo} className="w-10 h-10 p-0">
-          <Undo className="w-5 h-5" />
-        </Button>
-        <Button variant="ghost" size="sm" onClick={redo} disabled={!canRedo} className="w-10 h-10 p-0">
-          <Redo className="w-5 h-5" />
-        </Button>
       </div>
 
       <div className="flex-1 relative flex items-center justify-center">
@@ -604,19 +759,26 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
           <X className="w-6 h-6 text-black" />
         </Button>
 
-        <div ref={containerRef} className="relative max-w-full max-h-full">
+        <div ref={containerRef} className="relative max-w-full max-h-full mx-auto my-auto">
           <img
             ref={imageRef}
             src={image || "/placeholder.svg"}
             alt="Canvas editor"
-            className="max-w-full max-h-full object-contain select-none"
+            className={`${initialized ? "absolute" : "max-w-full max-h-full object-contain"} select-none`}
             onLoad={setupCanvas}
             crossOrigin="anonymous"
             draggable={false}
+            style={initialized ? {
+              left: `${view.cssPad}px`,
+              top: `${view.cssPad}px`,
+              width: `${Math.max(1, view.imgCssW)}px`,
+              height: `${Math.max(1, view.imgCssH)}px`,
+              pointerEvents: "none",
+            } : { pointerEvents: "none" }}
           />
           <canvas
             ref={canvasRef}
-            className="absolute top-0 left-0 cursor-crosshair touch-none"
+            className="absolute top-0 left-0 touch-none z-10 cursor-crosshair"
             onPointerDown={beginPointer}
             onPointerMove={movePointer}
             onPointerUp={endPointer}
@@ -674,7 +836,7 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
           )}
         </div>
 
-        <div className="absolute bottom-4 right-4 flex items-center gap-2">
+        <div className="absolute bottom-4 right-4 flex items-center gap-2 z-30">
           <div className="text-xs text-gray-600 bg-white/70 px-2 py-1 rounded border">
             {tool.toUpperCase()} • {lineWidth}px
           </div>
