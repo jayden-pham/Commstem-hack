@@ -88,6 +88,7 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const editorAreaRef = useRef<HTMLDivElement>(null)
 
   const naturalSize = useMemo(() => {
     const img = imageRef.current
@@ -104,13 +105,28 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
     const dpr = getDPR()
     const natW = img.naturalWidth || img.width
     const natH = img.naturalHeight || img.height
-    canvas.width = Math.max(1, Math.floor(natW * dpr))
-    canvas.height = Math.max(1, Math.floor(natH * dpr))
+    // Compute displayed size that fully contains the image within the editor area
+    const host = editorAreaRef.current || canvas.parentElement || document.body
+    const hostRect = host.getBoundingClientRect()
+    const availW = Math.max(1, hostRect.width)
+    const availH = Math.max(1, hostRect.height)
+    const scale = Math.min(availW / natW, availH / natH)
+    const dispW = Math.max(1, Math.floor(natW * scale))
+    const dispH = Math.max(1, Math.floor(natH * scale))
+
+    canvas.width = Math.max(1, Math.floor(dispW * dpr))
+    canvas.height = Math.max(1, Math.floor(dispH * dpr))
     ctx.setTransform(1, 0, 0, 1, 0, 0)
     ctx.scale(dpr, dpr)
-    const rect = img.getBoundingClientRect()
-    canvas.style.width = `${rect.width}px`
-    canvas.style.height = `${rect.height}px`
+    canvas.style.width = `${dispW}px`
+    canvas.style.height = `${dispH}px`
+    if (containerRef.current) {
+      containerRef.current.style.width = `${dispW}px`
+      containerRef.current.style.height = `${dispH}px`
+    }
+    // Ensure the image element matches the displayed size
+    img.style.width = `${dispW}px`
+    img.style.height = `${dispH}px`
     ctx.lineCap = "round"
     ctx.lineJoin = "round"
     redraw()
@@ -121,7 +137,12 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
     if (!img) return
     const obs = new ResizeObserver(() => setupCanvas())
     obs.observe(img)
-    return () => obs.disconnect()
+    const onResize = () => setupCanvas()
+    window.addEventListener("resize", onResize)
+    return () => {
+      obs.disconnect()
+      window.removeEventListener("resize", onResize)
+    }
   }, [setupCanvas])
 
   const clientToNatural = (e: { clientX: number; clientY: number }) => {
@@ -599,7 +620,7 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
         </Button>
       </div>
 
-      <div className="flex-1 relative flex items-center justify-center">
+      <div ref={editorAreaRef} className="flex-1 relative flex items-center justify-center">
         <Button onClick={onClose} className="absolute top-4 right-4 z-20" variant="ghost" size="sm">
           <X className="w-6 h-6 text-black" />
         </Button>
@@ -609,7 +630,7 @@ const CanvasEditor = forwardRef<CanvasEditorHandle, CanvasEditorProps>(({ image,
             ref={imageRef}
             src={image || "/placeholder.svg"}
             alt="Canvas editor"
-            className="max-w-full max-h-full object-contain select-none"
+            className="select-none"
             onLoad={setupCanvas}
             crossOrigin="anonymous"
             draggable={false}
